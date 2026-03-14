@@ -60,17 +60,18 @@ def should_start_polling(start_iso: str, delay_hours: float = 1.5) -> bool:
     return now >= poll_start
 
 
-def poll_game(game: Dict) -> Optional[Dict]:
-    """Check a single game; return finished game info or None."""
+def poll_all_games() -> List[Dict]:
+    """Call /scores once and return the full list."""
     params = {
         "apiKey": ODDS_API_KEY,
-        "daysFrom": 1,
+        "daysFrom": 1,  # or omit if you only need live/upcoming
     }
     resp = requests.get(SCORES_ENDPOINT, params=params)
     resp.raise_for_status()
-    data = resp.json()
+    return resp.json()
 
-    for g in data:
+def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]:
+    for g in all_scores:
         if g.get("id") != game["id"]:
             continue
 
@@ -123,7 +124,17 @@ def main():
 
         # Every 2 minutes: poll games that should be active
         current_minute = datetime.datetime.utcnow().minute
-        if current_minute % 2 == 0:
+        if current_minute % 2 == 0 and games:
+            print("Polling loop tick...")
+
+            # Single /scores call for all games
+            try:
+                all_scores = poll_all_games()
+            except Exception as e:
+                print(f"Error calling scores endpoint: {e}")
+                time.sleep(60)
+                continue
+
             for game in games:
                 if game["notified"]:
                     continue
@@ -134,7 +145,7 @@ def main():
                 if not game["poll_active"]:
                     continue
 
-                finished = poll_game(game)
+                finished = find_finished_for_game(game, all_scores)
                 if finished:
                     send_discord_webhook(finished)
                     game["notified"] = True
