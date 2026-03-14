@@ -38,25 +38,31 @@ def now_central_str() -> str:
     return now_central.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
-def fetch_todays_games() -> List[Dict]:
-    """Fetch today's games once, using the scores endpoint."""
+def fetch_todays_games_central() -> List[Dict]:
+    """
+    Fetch games and keep only those whose tip date is 'today' in Central time,
+    regardless of UTC date. Called once on startup.
+    """
     params = {
         "apiKey": ODDS_API_KEY,
-        "daysFrom": 1,  # today and near future
+        "daysFrom": 1,
     }
     resp = requests.get(SCORES_ENDPOINT, params=params)
     resp.raise_for_status()
     data = resp.json()
 
-    games = []
-    today = datetime.datetime.now(UTC).date()
+    games: List[Dict] = []
+
+    today_central = datetime.datetime.now(CENTRAL).date()
 
     for g in data:
-        if not g.get("commence_time"):
+        commence = g.get("commence_time")
+        if not commence:
             continue
 
-        start_dt = iso_to_utc_dt(g["commence_time"])
-        if start_dt.date() != today:
+        utc_start = iso_to_utc_dt(commence)
+        central_start = utc_start.astimezone(CENTRAL)
+        if central_start.date() != today_central:
             continue
 
         games.append(
@@ -64,13 +70,17 @@ def fetch_todays_games() -> List[Dict]:
                 "id": g["id"],
                 "home": g["home_team"],
                 "away": g["away_team"],
-                "start_time": g["commence_time"],  # ISO string
+                "start_time": commence,  # ISO string (UTC)
                 "poll_active": False,
                 "notified": False,
             }
         )
 
-    print(f"[INIT] Fetched {len(games)} games for today.", flush=True)
+    print(
+        f"[INIT] {now_central_str()} Fetched {len(games)} games for today "
+        f"(Central date {today_central}).",
+        flush=True,
+    )
     for game in games:
         print(
             f"[INIT] Tracking {game['home']} vs {game['away']} "
@@ -178,24 +188,18 @@ def main():
     except Exception as e:
         print(f"[DISCORD] Failed to send startup notification: {e}", flush=True)
 
-    games: List[Dict] = []
-    last_refresh_date: Optional[datetime.date] = None
+    # Fetch today's games in Central time once per restart
+    print(
+        f"[INIT] {now_central_str()} Loading today's games (Central)...",
+        flush=True,
+    )
+    try:
+        games: List[Dict] = fetch_todays_games_central()
+    except Exception as e:
+        print(f"[INIT] Error fetching today's games: {e}", flush=True)
+        games = []
 
     while True:
-        today = datetime.datetime.now(UTC).date()
-
-        # Refresh today's games once per day
-        if last_refresh_date != today:
-            print(
-                f"[INIT] {now_central_str()} Refreshing today's games list...",
-                flush=True,
-            )
-            try:
-                games = fetch_todays_games()
-                last_refresh_date = today
-            except Exception as e:
-                print(f"[INIT] Error fetching today's games: {e}", flush=True)
-
         # Every 2 minutes: poll games that should be active
         current_minute = datetime.datetime.now(UTC).minute
         if current_minute % 2 == 0 and games:
