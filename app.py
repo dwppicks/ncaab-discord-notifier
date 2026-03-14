@@ -19,11 +19,6 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SPORT_KEY = "basketball_ncaab"
 SCORES_ENDPOINT = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
 
-def now_central_str() -> str:
-    """Current time in US Central as a readable string."""
-    now_central = datetime.datetime.now(UTC).astimezone(CENTRAL)
-    return now_central.strftime("%Y-%m-%d %I:%M:%S %p %Z")
-
 
 def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
     """Parse ISO8601 string from The Odds API into timezone-aware UTC datetime."""
@@ -35,6 +30,12 @@ def format_game_time_central(start_iso: str) -> str:
     utc_dt = iso_to_utc_dt(start_iso)
     central_dt = utc_dt.astimezone(CENTRAL)
     return central_dt.strftime("%Y-%m-%d %I:%M %p %Z")
+
+
+def now_central_str() -> str:
+    """Current time in US Central as a readable string."""
+    now_central = datetime.datetime.now(UTC).astimezone(CENTRAL)
+    return now_central.strftime("%Y-%m-%d %I:%M:%S %p %Z")
 
 
 def fetch_todays_games() -> List[Dict]:
@@ -69,11 +70,12 @@ def fetch_todays_games() -> List[Dict]:
             }
         )
 
-    print(f"[INIT] Fetched {len(games)} games for today.")
+    print(f"[INIT] Fetched {len(games)} games for today.", flush=True)
     for game in games:
         print(
             f"[INIT] Tracking {game['home']} vs {game['away']} "
-            f"at {format_game_time_central(game['start_time'])}"
+            f"at {format_game_time_central(game['start_time'])}",
+            flush=True,
         )
 
     return games
@@ -100,33 +102,31 @@ def poll_all_games() -> List[Dict]:
     remaining = resp.headers.get("x-requests-remaining")
     used = resp.headers.get("x-requests-used")
     last_cost = resp.headers.get("x-requests-last")
-    print(f"[ODDS] Remaining={remaining}, Used={used}, LastCost={last_cost}")
+    print(
+        f"[ODDS] Remaining={remaining}, Used={used}, LastCost={last_cost}",
+        flush=True,
+    )
 
     return resp.json()
 
 
 def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]:
-    """From the full /scores response, find this game and see if it's done."""
-    FINAL_STATUSES = {
-        "STATUS_FINAL",
-        "STATUS_COMPLETE",
-        "STATUS_FULL_TIME",
-        "STATUS_POSTPONED",   # optional, if you want to treat postponed as done
-        "STATUS_CANCELED",    # optional
-    }
-
+    """
+    From the full /scores response, treat any game with a scores array as done.
+    The Odds API's NCAAB feed often leaves status=None even for completed games.
+    """
     for g in all_scores:
         if g.get("id") != game["id"]:
             continue
 
-        status = g.get("status")
-        if status in FINAL_STATUSES:
+        scores = g.get("scores")
+        if scores:
             return {
                 "id": g["id"],
                 "home": g["home_team"],
                 "away": g["away_team"],
-                "status": status,
-                "scores": g.get("scores", []),
+                "status": g.get("status"),  # often None for NCAAB
+                "scores": scores,
                 "start_time": g.get("commence_time"),
             }
 
@@ -156,7 +156,11 @@ def send_discord_webhook(game: Dict):
 
     resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
     resp.raise_for_status()
-    print(f"[DISCORD] Sent final notification for {game['home']} vs {game['away']}")
+    print(
+        f"[DISCORD] Sent final notification for "
+        f"{game['home']} vs {game['away']}",
+        flush=True,
+    )
 
 
 def main():
@@ -170,9 +174,9 @@ def main():
         }
         r = requests.post(DISCORD_WEBHOOK_URL, json=startup_msg)
         r.raise_for_status()
-        print("[DISCORD] Sent startup notification")
+        print("[DISCORD] Sent startup notification", flush=True)
     except Exception as e:
-        print(f"[DISCORD] Failed to send startup notification: {e}")
+        print(f"[DISCORD] Failed to send startup notification: {e}", flush=True)
 
     games: List[Dict] = []
     last_refresh_date: Optional[datetime.date] = None
@@ -182,25 +186,31 @@ def main():
 
         # Refresh today's games once per day
         if last_refresh_date != today:
-            print("[INIT] Refreshing today's games list...")
+            print(
+                f"[INIT] {now_central_str()} Refreshing today's games list...",
+                flush=True,
+            )
             try:
                 games = fetch_todays_games()
                 last_refresh_date = today
             except Exception as e:
-                print(f"[INIT] Error fetching today's games: {e}")
+                print(f"[INIT] Error fetching today's games: {e}", flush=True)
 
         # Every 2 minutes: poll games that should be active
         current_minute = datetime.datetime.now(UTC).minute
         if current_minute % 2 == 0 and games:
-            print("=== Polling loop tick ===")
+            print("=== Polling loop tick ===", flush=True)
             active_games = [g for g in games if not g["notified"]]
-            print(f"[GAMES] Tracking {len(active_games)} games not yet notified")
+            print(
+                f"[GAMES] Tracking {len(active_games)} games not yet notified",
+                flush=True,
+            )
 
             # Single /scores call for all games
             try:
                 all_scores = poll_all_games()
             except Exception as e:
-                print(f"[ODDS] Error calling scores endpoint: {e}")
+                print(f"[ODDS] Error calling scores endpoint: {e}", flush=True)
                 time.sleep(60)
                 continue
 
@@ -219,34 +229,34 @@ def main():
                     print(
                         f"[GAMES] Not yet time to poll "
                         f"{game['home']} vs {game['away']} "
-                        f"({format_game_time_central(game['start_time'])})"
+                        f"({format_game_time_central(game['start_time'])})",
+                        flush=True,
                     )
                     continue
 
                 finished = find_finished_for_game(game, all_scores)
-                finished = find_finished_for_game(game, all_scores)
                 if finished:
                     print(
-                        f"[GAMES] Detected done ({finished['status']}): "
-                        f"{finished['home']} vs {finished['away']}",
+                        f"[GAMES] Detected done (status={finished['status']}): "
+                        f"{finished['home']} vs {finished['away']} "
+                        f"with scores={finished['scores']}",
                         flush=True,
                     )
                     send_discord_webhook(finished)
                     game["notified"] = True
                 else:
-                    # Debug: show current status for games that should be done
-                    # (optional, can be noisy)
-                    for g in all_scores:
-                        if g.get("id") == game["id"]:
-                            print(
-                                f"[DEBUG] Game {g['home_team']} vs {g['away_team']} "
-                                f"status={g.get('status')}",
-                                flush=True,
-                            )
-                            break
+                    print(
+                        f"[DEBUG] Game {game['home']} vs {game['away']} "
+                        f"has no scores yet",
+                        flush=True,
+                    )
 
-        print(f"[HEARTBEAT] {now_central_str()} Loop iteration complete", flush=True)
+        print(
+            f"[HEARTBEAT] {now_central_str()} Loop iteration complete",
+            flush=True,
+        )
         time.sleep(60)
+
 
 if __name__ == "__main__":
     main()
