@@ -19,6 +19,11 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 SPORT_KEY = "basketball_ncaab"
 SCORES_ENDPOINT = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
 
+def now_central_str() -> str:
+    """Current time in US Central as a readable string."""
+    now_central = datetime.datetime.now(UTC).astimezone(CENTRAL)
+    return now_central.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+
 
 def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
     """Parse ISO8601 string from The Odds API into timezone-aware UTC datetime."""
@@ -101,13 +106,21 @@ def poll_all_games() -> List[Dict]:
 
 
 def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]:
-    """From the full /scores response, find this game and see if it's final."""
+    """From the full /scores response, find this game and see if it's done."""
+    FINAL_STATUSES = {
+        "STATUS_FINAL",
+        "STATUS_COMPLETE",
+        "STATUS_FULL_TIME",
+        "STATUS_POSTPONED",   # optional, if you want to treat postponed as done
+        "STATUS_CANCELED",    # optional
+    }
+
     for g in all_scores:
         if g.get("id") != game["id"]:
             continue
 
         status = g.get("status")
-        if status == "STATUS_FINAL":
+        if status in FINAL_STATUSES:
             return {
                 "id": g["id"],
                 "home": g["home_team"],
@@ -195,9 +208,10 @@ def main():
                 if should_start_polling(game["start_time"]):
                     if not game["poll_active"]:
                         print(
-                            f"[GAMES] Activating polling for "
+                            f"[GAMES] {now_central_str()} Activating polling for "
                             f"{game['home']} vs {game['away']} "
-                            f"({format_game_time_central(game['start_time'])})"
+                            f"({format_game_time_central(game['start_time'])})",
+                            flush=True,
                         )
                     game["poll_active"] = True
 
@@ -210,16 +224,29 @@ def main():
                     continue
 
                 finished = find_finished_for_game(game, all_scores)
+                finished = find_finished_for_game(game, all_scores)
                 if finished:
                     print(
-                        f"[GAMES] Detected final: "
-                        f"{finished['home']} vs {finished['away']}"
+                        f"[GAMES] Detected done ({finished['status']}): "
+                        f"{finished['home']} vs {finished['away']}",
+                        flush=True,
                     )
                     send_discord_webhook(finished)
                     game["notified"] = True
+                else:
+                    # Debug: show current status for games that should be done
+                    # (optional, can be noisy)
+                    for g in all_scores:
+                        if g.get("id") == game["id"]:
+                            print(
+                                f"[DEBUG] Game {g['home_team']} vs {g['away_team']} "
+                                f"status={g.get('status')}",
+                                flush=True,
+                            )
+                            break
 
+        print(f"[HEARTBEAT] {now_central_str()} Loop iteration complete", flush=True)
         time.sleep(60)
-
 
 if __name__ == "__main__":
     main()
