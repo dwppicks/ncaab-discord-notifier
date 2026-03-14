@@ -144,6 +144,7 @@ def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]
 
 
 def send_discord_webhook(game: Dict):
+    """Send one final notification to Discord with basic rate limiting."""
     scores = game.get("scores", [])
     home_score = next(
         (s["score"] for s in scores if s["name"] == game["home"]), "?"
@@ -164,13 +165,39 @@ def send_discord_webhook(game: Dict):
         f"(tip: {tip_central})"
     )
 
-    resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
-    resp.raise_for_status()
-    print(
-        f"[DISCORD] Sent final notification for "
-        f"{game['home']} vs {game['away']}",
-        flush=True,
-    )
+    payload = {"content": content}
+
+    max_retries = 3
+    base_delay = 2.0
+
+    for attempt in range(1, max_retries + 1):
+        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else base_delay
+            print(
+                f"[DISCORD] 429 rate limited, waiting {wait}s before retry "
+                f"(attempt {attempt}/{max_retries})",
+                flush=True,
+            )
+            time.sleep(wait)
+            continue
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            print(f"[DISCORD] Error sending webhook: {e}", flush=True)
+        else:
+            print(
+                f"[DISCORD] Sent final notification for "
+                f"{game['home']} vs {game['away']}",
+                flush=True,
+            )
+        break
+
+    # Small sleep to avoid hammering Discord when sending multiple finals
+    time.sleep(0.5)
 
 
 def main():
@@ -218,6 +245,9 @@ def main():
                 time.sleep(60)
                 continue
 
+            max_sends_per_tick = 5
+            sends_this_tick = 0
+
             for game in active_games:
                 if should_start_polling(game["start_time"]):
                     if not game["poll_active"]:
@@ -248,6 +278,14 @@ def main():
                     )
                     send_discord_webhook(finished)
                     game["notified"] = True
+                    sends_this_tick += 1
+
+                    if sends_this_tick >= max_sends_per_tick:
+                        print(
+                            "[GAMES] Hit per-tick send cap, will send more next tick",
+                            flush=True,
+                        )
+                        break
                 else:
                     print(
                         f"[DEBUG] Game {game['home']} vs {game['away']} "
