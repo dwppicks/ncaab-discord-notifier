@@ -1,34 +1,40 @@
 import os
+import json
 import time
 import datetime
-from typing import Dict, List, Optional
+import threading
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from dateutil import parser
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Timezones
 # ---------------------------------------------------------------------------
-UTC = datetime.timezone.utc
+UTC     = datetime.timezone.utc
 CENTRAL = ZoneInfo("America/Chicago")
 
 # ---------------------------------------------------------------------------
 # Env vars
 # ---------------------------------------------------------------------------
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+ODDS_API_KEY        = os.getenv("ODDS_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+TWILIO_ACCOUNT_SID  = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN   = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER  = os.getenv("TWILIO_FROM_NUMBER")   # e.g. +15551234567
+GSHEETS_SHEET_ID    = os.getenv("GSHEETS_SHEET_ID")     # ID from the Google Sheet URL
+GOOGLE_CREDS_JSON   = os.getenv("GOOGLE_CREDS_JSON")    # Service account JSON as a string
 
 # ---------------------------------------------------------------------------
 # Odds API config
 # ---------------------------------------------------------------------------
-SPORT_KEY = "basketball_ncaab"
+SPORT_KEY       = "basketball_ncaab"
 SCORES_ENDPOINT = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
 
 # ---------------------------------------------------------------------------
 # Tournament round definitions (Central dates → payout)
 # ---------------------------------------------------------------------------
-# Each entry: (start_date, end_date, round_name, payout)
 TOURNAMENT_ROUNDS = [
     (datetime.date(2026, 3, 19), datetime.date(2026, 3, 20), "Round of 64",  60),
     (datetime.date(2026, 3, 21), datetime.date(2026, 3, 22), "Round of 32",  125),
@@ -38,8 +44,7 @@ TOURNAMENT_ROUNDS = [
     (datetime.date(2026, 4, 6),  datetime.date(2026, 4, 6),  "Championship", 1480),
 ]
 
-def get_round_info(game_date: datetime.date):
-    """Return (round_name, payout) for a given Central date, or (None, None)."""
+def get_round_info(game_date: datetime.date) -> Tuple[Optional[str], Optional[int]]:
     for start, end, name, payout in TOURNAMENT_ROUNDS:
         if start <= game_date <= end:
             return name, payout
@@ -47,16 +52,13 @@ def get_round_info(game_date: datetime.date):
 
 # ---------------------------------------------------------------------------
 # Tournament team filter
-# Loaded from tournament-teams.csv at startup.
-# Only games where BOTH teams are in this set will be processed.
 # ---------------------------------------------------------------------------
 def load_tournament_teams(csv_path: str = "tournament-teams.csv") -> set:
-    """Load the set of tournament team names from CSV (one per line, header 'team')."""
     import csv as _csv
     teams = set()
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = _csv.reader(f)
-        next(reader)  # skip header
+        next(reader)
         for row in reader:
             if row and row[0].strip():
                 teams.add(row[0].strip())
@@ -66,30 +68,21 @@ def load_tournament_teams(csv_path: str = "tournament-teams.csv") -> set:
 TOURNAMENT_TEAMS = load_tournament_teams()
 
 def is_tournament_game(home: str, away: str) -> bool:
-    """Return True if at least one team is in the tournament field."""
     def team_in_field(name: str) -> bool:
         name_lower = name.lower()
         return any(t.lower() in name_lower or name_lower in t.lower() for t in TOURNAMENT_TEAMS)
     return team_in_field(home) or team_in_field(away)
 
 # ---------------------------------------------------------------------------
-# Squares grid  (winner_digit, loser_digit) → owner name
-# Loaded from square-assignments.csv at startup.
-# To update for a new year: just replace the CSV, no code changes needed.
+# Squares grid  (winner_digit, loser_digit) → square_name
 # ---------------------------------------------------------------------------
 def load_squares_grid(csv_path: str = "square-assignments.csv") -> Dict[tuple, str]:
-    """
-    Load the squares grid from a CSV file.
-    Row 1 (header): blank, then winner digits 0-9
-    Col A: loser digit (0-9)
-    Each cell: owner name
-    """
     import csv as _csv
     grid: Dict[tuple, str] = {}
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = _csv.reader(f)
         rows = list(reader)
-    for row in rows[1:]:  # skip header
+    for row in rows[1:]:
         if not row:
             continue
         loser_digit = int(row[0])
@@ -100,13 +93,190 @@ def load_squares_grid(csv_path: str = "square-assignments.csv") -> Dict[tuple, s
     print(f"[INIT] Loaded squares grid from {csv_path} ({len(grid)} squares)", flush=True)
     return grid
 
-# Loaded once at startup — just update square-assignments.csv each year, no code changes needed
 SQUARES_GRID = load_squares_grid()
 
 def lookup_square(winner_score: int, loser_score: int) -> Optional[str]:
-    """Return the Discord tag for the winning square, or None."""
     key = (winner_score % 10, loser_score % 10)
     return SQUARES_GRID.get(key)
+
+# ---------------------------------------------------------------------------
+# Running totals  — persisted to totals.json so restarts don't wipe them
+# Key: primary phone number (e.g. "+15551234567")
+# ---------------------------------------------------------------------------
+TOTALS_FILE = "totals.json"
+
+def load_totals() -> Dict[str, int]:
+    if os.path.exists(TOTALS_FILE):
+        with open(TOTALS_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_totals(totals: Dict[str, int]):
+    with open(TOTALS_FILE, "w") as f:
+        json.dump(totals, f, indent=2)
+
+# Shared in-memory totals (loaded once, updated on each win)
+TOTALS: Dict[str, int] = load_totals()
+TOTALS_LOCK = threading.Lock()
+
+def add_to_total(phone: str, amount: int) -> int:
+    """Add amount to phone's running total, persist, return new total."""
+    with TOTALS_LOCK:
+        TOTALS[phone] = TOTALS.get(phone, 0) + amount
+        save_totals(TOTALS)
+        return TOTALS[phone]
+
+def get_total(phone: str) -> int:
+    with TOTALS_LOCK:
+        return TOTALS.get(phone, 0)
+
+# ---------------------------------------------------------------------------
+# Google Sheets — phone number registry
+#
+# Expected sheet columns (from Google Form responses):
+#   A: Timestamp
+#   B: Name (optional — defaults to square name if blank)
+#   C: Square name (dropdown)
+#   D: Primary phone
+#   E: Secondary phone (optional)
+#   F: Report an error / Leave a note (ignored by code)
+#
+# Registry built from this: (winner_digit, loser_digit) →
+#   {"display_name": str, "phones": [str, ...]}
+# One person may appear multiple times (multiple squares) — all map to same phones.
+# ---------------------------------------------------------------------------
+
+# Thread-safe registry updated every 30 minutes
+PHONE_REGISTRY: Dict[tuple, Dict] = {}
+REGISTRY_LOCK  = threading.Lock()
+
+def _normalize_phone(raw: str) -> Optional[str]:
+    """Strip formatting and ensure E.164 format (+1XXXXXXXXXX for US numbers)."""
+    if not raw:
+        return None
+    digits = "".join(c for c in raw if c.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None  # unrecognizable format — skip
+
+def _square_name_to_digits(square_name: str) -> Optional[Tuple[int, int]]:
+    """
+    Look up a square name in SQUARES_GRID and return (winner_digit, loser_digit).
+    Strips the digit hint from the dropdown label if present,
+    e.g. 'Bad Boyz (0,9) & (5,0) & (7,8)' → 'Bad Boyz'
+    Returns the FIRST matching square (registration handles multi-square owners).
+    """
+    import re
+    # Strip everything from the first '(' onward to get the bare name
+    bare = re.sub(r'\s*\(.*', '', square_name).strip()
+    for (w, l), name in SQUARES_GRID.items():
+        if name.strip().lower() == bare.lower():
+            return (w, l)
+    return None
+
+def _square_name_to_all_digits(square_name: str) -> List[Tuple[int, int]]:
+    """
+    Return ALL (winner_digit, loser_digit) squares owned by this name.
+    Used so multi-square owners get registered for every square they own.
+    """
+    import re
+    bare = re.sub(r'\s*\(.*', '', square_name).strip()
+    return [(w, l) for (w, l), name in SQUARES_GRID.items()
+            if name.strip().lower() == bare.lower()]
+
+def fetch_phone_registry() -> Dict[tuple, Dict]:
+    """
+    Pull the Google Sheet and build the phone registry.
+    Returns a dict keyed by (winner_digit, loser_digit).
+    """
+    if not GSHEETS_SHEET_ID or not GOOGLE_CREDS_JSON:
+        print("[SHEETS] Missing GSHEETS_SHEET_ID or GOOGLE_CREDS_JSON — SMS disabled.", flush=True)
+        return {}
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        creds_info = json.loads(GOOGLE_CREDS_JSON)
+        scopes     = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        creds      = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        gc         = gspread.authorize(creds)
+        sheet      = gc.open_by_key(GSHEETS_SHEET_ID).sheet1
+        rows       = sheet.get_all_values()
+
+        if len(rows) < 2:
+            print("[SHEETS] Sheet has no responses yet.", flush=True)
+            return {}
+
+        registry: Dict[tuple, Dict] = {}
+
+        for row in rows[1:]:  # skip header
+            # Pad row to at least 6 cols
+            row = (row + [""] * 6)[:6]
+            _, name, sq_name, phone1, phone2, _note = row
+
+            # Resolve phones first — skip row if none valid
+            phones = []
+            p1 = _normalize_phone(phone1)
+            p2 = _normalize_phone(phone2)
+            if p1:
+                phones.append(p1)
+            if p2 and p2 not in phones:
+                phones.append(p2)
+            if not phones:
+                continue
+
+            # Register ALL squares owned by this name (handles multi-square owners)
+            keys = _square_name_to_all_digits(sq_name)
+            if not keys:
+                print(f"[SHEETS] Could not match square name '{sq_name}' to grid — skipping.", flush=True)
+                continue
+
+            for key in keys:
+                # Display name defaults to square name from grid if left blank
+                display = name.strip() or SQUARES_GRID.get(key, f"Square {key}")
+                # Latest submission wins for each square
+                registry[key] = {"display_name": display, "phones": phones}
+
+        print(f"[SHEETS] Loaded {len(registry)} square phone registrations.", flush=True)
+        return registry
+
+    except Exception as e:
+        print(f"[SHEETS] Error fetching registry: {e}", flush=True)
+        return {}
+
+def refresh_registry_loop(interval_seconds: int = 1800):
+    """Background thread: refresh phone registry every 30 minutes."""
+    global PHONE_REGISTRY
+    while True:
+        time.sleep(interval_seconds)
+        new_registry = fetch_phone_registry()
+        with REGISTRY_LOCK:
+            PHONE_REGISTRY.update(new_registry)
+        print(f"[SHEETS] Registry refreshed — {len(PHONE_REGISTRY)} registrations.", flush=True)
+
+def get_registration(winner_digit: int, loser_digit: int) -> Optional[Dict]:
+    with REGISTRY_LOCK:
+        return PHONE_REGISTRY.get((winner_digit, loser_digit))
+
+# ---------------------------------------------------------------------------
+# Twilio SMS
+# ---------------------------------------------------------------------------
+def send_sms(to: str, body: str):
+    """Send a single SMS via Twilio REST API."""
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
+        print(f"[SMS] Twilio env vars missing — skipping SMS to {to}", flush=True)
+        return
+    url  = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+    data = {"From": TWILIO_FROM_NUMBER, "To": to, "Body": body}
+    try:
+        resp = requests.post(url, data=data, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        resp.raise_for_status()
+        print(f"[SMS] Sent to {to}: {body[:60]}...", flush=True)
+    except Exception as e:
+        print(f"[SMS] Error sending to {to}: {e}", flush=True)
 
 # ---------------------------------------------------------------------------
 # Datetime helpers
@@ -115,9 +285,7 @@ def iso_to_utc_dt(iso_str: str) -> datetime.datetime:
     return parser.isoparse(iso_str).astimezone(UTC)
 
 def format_game_time_central(start_iso: str) -> str:
-    utc_dt = iso_to_utc_dt(start_iso)
-    central_dt = utc_dt.astimezone(CENTRAL)
-    return central_dt.strftime("%Y-%m-%d %I:%M %p %Z")
+    return iso_to_utc_dt(start_iso).astimezone(CENTRAL).strftime("%Y-%m-%d %I:%M %p %Z")
 
 def now_central_str() -> str:
     return datetime.datetime.now(UTC).astimezone(CENTRAL).strftime("%Y-%m-%d %I:%M:%S %p %Z")
@@ -127,9 +295,9 @@ def now_central_str() -> str:
 # ---------------------------------------------------------------------------
 def fetch_todays_games_central() -> List[Dict]:
     params = {"apiKey": ODDS_API_KEY, "daysFrom": 1}
-    resp = requests.get(SCORES_ENDPOINT, params=params)
+    resp   = requests.get(SCORES_ENDPOINT, params=params)
     resp.raise_for_status()
-    data = resp.json()
+    data   = resp.json()
 
     today_central = datetime.datetime.now(CENTRAL).date()
     games: List[Dict] = []
@@ -153,27 +321,23 @@ def fetch_todays_games_central() -> List[Dict]:
             "notified":    False,
         })
 
-    print(f"[INIT] {now_central_str()} Fetched {len(games)} games for today (Central date {today_central}).", flush=True)
+    print(f"[INIT] {now_central_str()} Fetched {len(games)} tournament games for today.", flush=True)
     for game in games:
-        print(f"[INIT] Tracking {game['home']} vs {game['away']} at {format_game_time_central(game['start_time'])}", flush=True)
+        print(f"[INIT]   {game['home']} vs {game['away']} at {format_game_time_central(game['start_time'])}", flush=True)
     return games
-
 
 def should_start_polling(start_iso: str, delay_hours: float = 1.5) -> bool:
     poll_start = iso_to_utc_dt(start_iso) + datetime.timedelta(hours=delay_hours)
     return datetime.datetime.now(UTC) >= poll_start
 
-
 def poll_all_games(days_from: int = 1) -> List[Dict]:
     params = {"apiKey": ODDS_API_KEY, "daysFrom": days_from}
-    resp = requests.get(SCORES_ENDPOINT, params=params)
+    resp   = requests.get(SCORES_ENDPOINT, params=params)
     resp.raise_for_status()
-    remaining  = resp.headers.get("x-requests-remaining")
-    used       = resp.headers.get("x-requests-used")
-    last_cost  = resp.headers.get("x-requests-last")
-    print(f"[ODDS] Remaining={remaining}, Used={used}, LastCost={last_cost}", flush=True)
+    print(f"[ODDS] Remaining={resp.headers.get('x-requests-remaining')}  "
+          f"Used={resp.headers.get('x-requests-used')}  "
+          f"LastCost={resp.headers.get('x-requests-last')}", flush=True)
     return resp.json()
-
 
 def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]:
     for g in all_scores:
@@ -192,80 +356,92 @@ def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]
     return None
 
 # ---------------------------------------------------------------------------
-# Discord notification
+# Notifications (Discord + SMS)
 # ---------------------------------------------------------------------------
-def send_discord_webhook(game: Dict):
-    scores      = game.get("scores", [])
-    home_score  = next((int(s["score"]) for s in scores if s["name"] == game["home"]), None)
-    away_score  = next((int(s["score"]) for s in scores if s["name"] == game["away"]), None)
+def notify_game_result(game: Dict):
+    """Parse final score, post to Discord, and SMS the square winner."""
+    scores     = game.get("scores", [])
+    home_score = next((int(s["score"]) for s in scores if s["name"] == game["home"]), None)
+    away_score = next((int(s["score"]) for s in scores if s["name"] == game["away"]), None)
 
     if home_score is None or away_score is None:
-        print(f"[DISCORD] Could not parse scores for {game['home']} vs {game['away']}, skipping.", flush=True)
+        print(f"[NOTIFY] Could not parse scores for {game['home']} vs {game['away']}, skipping.", flush=True)
         return
 
-    # Determine winner/loser
+    # Winner / loser
     if home_score >= away_score:
-        winner_name,  winner_pts = game["home"], home_score
-        loser_name,   loser_pts  = game["away"], away_score
+        winner_name, winner_pts = game["home"], home_score
+        loser_name,  loser_pts  = game["away"], away_score
     else:
-        winner_name,  winner_pts = game["away"], away_score
-        loser_name,   loser_pts  = game["home"], home_score
+        winner_name, winner_pts = game["away"], away_score
+        loser_name,  loser_pts  = game["home"], home_score
 
     winner_digit = winner_pts % 10
     loser_digit  = loser_pts  % 10
 
-    # Squares lookup
-    owner = lookup_square(winner_pts, loser_pts)
-    owner_text = owner if owner else "unowned square"
+    # Square owner name (from grid CSV)
+    square_name = lookup_square(winner_pts, loser_pts) or "unowned square"
 
     # Round + payout
-    game_date = iso_to_utc_dt(game["start_time"]).astimezone(CENTRAL).date()
+    game_date  = iso_to_utc_dt(game["start_time"]).astimezone(CENTRAL).date()
     round_name, payout = get_round_info(game_date)
-    round_text  = round_name if round_name else "Tournament"
+    round_text  = round_name or "Tournament"
     payout_text = f"${payout:,}" if payout else "N/A"
 
-    tip_central = format_game_time_central(game["start_time"]) if game.get("start_time") else "unknown time"
+    tip_central = format_game_time_central(game["start_time"]) if game.get("start_time") else "unknown"
 
-    content = (
+    # ── Discord ──────────────────────────────────────────────────────────────
+    discord_msg = (
         f"✅ **NCAAB Final ({round_text})** | "
         f"{winner_name} **{winner_pts}** - {loser_name} **{loser_pts}** "
         f"(tip: {tip_central})\n"
-        f"🏆 Square **({winner_digit}, {loser_digit})** wins **{payout_text}** — congrats {owner_text}!"
+        f"🏆 Square **({winner_digit}, {loser_digit})** wins **{payout_text}** — congrats {square_name}!"
     )
+    _send_discord(discord_msg)
 
-    payload = {"content": content}
+    # ── SMS ──────────────────────────────────────────────────────────────────
+    if payout:
+        registration = get_registration(winner_digit, loser_digit)
+        if registration:
+            display_name = registration["display_name"]
+            for phone in registration["phones"]:
+                new_total = add_to_total(phone, payout)
+                sms_body  = (
+                    f"🏆 {display_name} — your square ({winner_digit},{loser_digit}) won!\n"
+                    f"{winner_name} {winner_pts} - {loser_name} {loser_pts} ({round_text})\n"
+                    f"You won ${payout:,}! Tournament total: ${new_total:,}"
+                )
+                send_sms(phone, sms_body)
+        else:
+            print(f"[SMS] No phone registration found for square ({winner_digit},{loser_digit}) — {square_name}", flush=True)
+
+
+def _send_discord(content: str):
+    if not DISCORD_WEBHOOK_URL:
+        return
     max_retries = 3
     base_delay  = 2.0
-
     for attempt in range(1, max_retries + 1):
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
         if resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else base_delay
+            wait = float(resp.headers.get("Retry-After", base_delay))
             print(f"[DISCORD] 429 rate limited, waiting {wait}s (attempt {attempt}/{max_retries})", flush=True)
             time.sleep(wait)
             continue
         try:
             resp.raise_for_status()
+            print(f"[DISCORD] Sent: {content[:80]}...", flush=True)
         except requests.HTTPError as e:
-            print(f"[DISCORD] Error sending webhook: {e}", flush=True)
-        else:
-            print(f"[DISCORD] Sent notification: {winner_name} {winner_pts} - {loser_name} {loser_pts} | square ({winner_digit},{loser_digit}) → {owner_text}", flush=True)
+            print(f"[DISCORD] Error: {e}", flush=True)
         break
-
-    time.sleep(0.5)  # small buffer between sends
+    time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
-# Backfill: post results for already-completed games (e.g. Round of 64)
+# Backfill: post results for already-completed games
 # ---------------------------------------------------------------------------
-def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.timedelta):
-    """
-    On startup, fetch the last 3 days of scores and post any completed games
-    that have a final score. Sends one per 20 seconds. Returns updated last_send_time.
-    """
+def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.timedelta) -> datetime.datetime:
     print(f"[BACKFILL] {now_central_str()} Fetching completed games from past 3 days...", flush=True)
     try:
-        # daysFrom=3 pulls games up to 3 days old
         all_scores = poll_all_games(days_from=3)
     except Exception as e:
         print(f"[BACKFILL] Error fetching scores: {e}", flush=True)
@@ -281,14 +457,6 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
     print(f"[BACKFILL] Found {len(completed)} completed tournament games to post.", flush=True)
 
     for g in completed:
-        game = {
-            "id":         g["id"],
-            "home":       g["home_team"],
-            "away":       g["away_team"],
-            "status":     g.get("status"),
-            "scores":     g["scores"],
-            "start_time": g.get("commence_time"),
-        }
         now_utc = datetime.datetime.now(UTC)
         gap = (now_utc - last_send_time).total_seconds()
         if gap < send_interval.total_seconds():
@@ -296,12 +464,18 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
             print(f"[BACKFILL] Waiting {wait:.1f}s before next send...", flush=True)
             time.sleep(wait)
 
-        send_discord_webhook(game)
+        notify_game_result({
+            "id":         g["id"],
+            "home":       g["home_team"],
+            "away":       g["away_team"],
+            "status":     g.get("status"),
+            "scores":     g["scores"],
+            "start_time": g.get("commence_time"),
+        })
         last_send_time = datetime.datetime.now(UTC)
 
-    print(f"[BACKFILL] Done posting {len(completed)} completed games.", flush=True)
+    print(f"[BACKFILL] Done.", flush=True)
     return last_send_time
-
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -310,23 +484,31 @@ def main():
     if not ODDS_API_KEY or not DISCORD_WEBHOOK_URL:
         raise RuntimeError("Missing ODDS_API_KEY or DISCORD_WEBHOOK_URL")
 
-    # Startup notification
+    # Startup Discord notification
     try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": "🚀 NCAAB notifier started on Render and is now polling."})
-        r.raise_for_status()
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": "🚀 NCAAB notifier started and is now polling."}).raise_for_status()
         print("[DISCORD] Sent startup notification", flush=True)
     except Exception as e:
-        print(f"[DISCORD] Failed to send startup notification: {e}", flush=True)
+        print(f"[DISCORD] Failed startup notification: {e}", flush=True)
 
-    # Rate-limit tracker for Discord sends (shared across backfill + live loop)
+    # Initial Google Sheets load
+    global PHONE_REGISTRY
+    PHONE_REGISTRY = fetch_phone_registry()
+
+    # Background thread: refresh sheet every 30 minutes
+    t = threading.Thread(target=refresh_registry_loop, args=(1800,), daemon=True)
+    t.start()
+    print("[SHEETS] Background registry refresh thread started (every 30 min).", flush=True)
+
+    # Rate-limit tracker (shared across backfill + live loop)
     last_send_time = datetime.datetime.min.replace(tzinfo=UTC)
     send_interval  = datetime.timedelta(seconds=20)
 
-    # Backfill: post all already-completed games (Round of 64, etc.)
+    # Backfill completed games
     last_send_time = run_backfill(last_send_time, send_interval)
 
-    # Fetch today's games once
-    print(f"[INIT] {now_central_str()} Loading today's games (Central)...", flush=True)
+    # Load today's games
+    print(f"[INIT] {now_central_str()} Loading today's games...", flush=True)
     try:
         games: List[Dict] = fetch_todays_games_central()
     except Exception as e:
@@ -338,19 +520,19 @@ def main():
         if current_minute % 2 == 0 and games:
             print("=== Polling loop tick ===", flush=True)
             active_games = [g for g in games if not g["notified"]]
-            print(f"[GAMES] Tracking {len(active_games)} games not yet notified", flush=True)
+            print(f"[GAMES] {len(active_games)} games not yet notified", flush=True)
 
             try:
                 all_scores = poll_all_games()
             except Exception as e:
-                print(f"[ODDS] Error calling scores endpoint: {e}", flush=True)
+                print(f"[ODDS] Error: {e}", flush=True)
                 time.sleep(60)
                 continue
 
             for game in active_games:
                 if should_start_polling(game["start_time"]):
                     if not game["poll_active"]:
-                        print(f"[GAMES] {now_central_str()} Activating polling for {game['home']} vs {game['away']}", flush=True)
+                        print(f"[GAMES] Activating polling for {game['home']} vs {game['away']}", flush=True)
                         game["poll_active"] = True
                 else:
                     print(f"[GAMES] Not yet time to poll {game['home']} vs {game['away']}", flush=True)
@@ -360,18 +542,18 @@ def main():
                 if finished:
                     now_utc = datetime.datetime.now(UTC)
                     if now_utc - last_send_time < send_interval:
-                        print("[DISCORD] Skipping send this tick to respect 20s interval", flush=True)
+                        print("[NOTIFY] Skipping this tick — respecting 20s interval", flush=True)
                         continue
 
-                    print(f"[GAMES] Detected done: {finished['home']} vs {finished['away']} scores={finished['scores']}", flush=True)
-                    send_discord_webhook(finished)
+                    print(f"[GAMES] Finished: {finished['home']} vs {finished['away']}", flush=True)
+                    notify_game_result(finished)
                     game["notified"] = True
-                    last_send_time = now_utc
-                    break  # one send per tick; rest will drain on future ticks
+                    last_send_time   = datetime.datetime.now(UTC)
+                    break  # one notification per tick
                 else:
-                    print(f"[DEBUG] {game['home']} vs {game['away']} has no scores yet", flush=True)
+                    print(f"[DEBUG] {game['home']} vs {game['away']} no scores yet", flush=True)
 
-        print(f"[HEARTBEAT] {now_central_str()} Loop iteration complete", flush=True)
+        print(f"[HEARTBEAT] {now_central_str()} Loop complete", flush=True)
         time.sleep(60)
 
 
