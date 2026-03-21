@@ -66,12 +66,11 @@ def load_tournament_teams(csv_path: str = "tournament-teams.csv") -> set:
 TOURNAMENT_TEAMS = load_tournament_teams()
 
 def is_tournament_game(home: str, away: str) -> bool:
-    """Return True only if both teams are in the tournament field."""
-    # Use partial matching to handle minor name variations from the Odds API
+    """Return True if at least one team is in the tournament field."""
     def team_in_field(name: str) -> bool:
         name_lower = name.lower()
         return any(t.lower() in name_lower or name_lower in t.lower() for t in TOURNAMENT_TEAMS)
-    return team_in_field(home) and team_in_field(away)
+    return team_in_field(home) or team_in_field(away)
 
 # ---------------------------------------------------------------------------
 # Squares grid  (winner_digit, loser_digit) → owner name
@@ -272,9 +271,12 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
         print(f"[BACKFILL] Error fetching scores: {e}", flush=True)
         return last_send_time
 
+    first_round_start = datetime.date(2026, 3, 19)
     completed = [
         g for g in all_scores
-        if g.get("scores") and is_tournament_game(g["home_team"], g["away_team"])
+        if g.get("scores")
+        and is_tournament_game(g["home_team"], g["away_team"])
+        and iso_to_utc_dt(g["commence_time"]).astimezone(CENTRAL).date() >= first_round_start
     ]
     print(f"[BACKFILL] Found {len(completed)} completed tournament games to post.", flush=True)
 
