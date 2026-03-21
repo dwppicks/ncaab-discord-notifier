@@ -47,27 +47,35 @@ def get_round_info(game_date: datetime.date):
     return None, None
 
 # ---------------------------------------------------------------------------
-# Squares grid  (winner_digit, loser_digit) → Discord tag
-#
-# 10×10 = 100 squares filled with fake test tags.
-# Replace with real Discord user IDs/tags before production use.
-# Format: @username  or  <@USER_ID>  for a real ping
+# Squares grid  (winner_digit, loser_digit) → owner name
+# Loaded from square-assignments.csv at startup.
+# To update for a new year: just replace the CSV, no code changes needed.
 # ---------------------------------------------------------------------------
-def _build_squares_grid() -> Dict[tuple, str]:
-    """Build a 100-square test grid with fake Discord tags."""
-    fake_users = [
-        "@alice", "@bob", "@carol", "@dave", "@eve",
-        "@frank", "@grace", "@hank", "@iris", "@jack",
-    ]
+def load_squares_grid(csv_path: str = "square-assignments.csv") -> Dict[tuple, str]:
+    """
+    Load the squares grid from a CSV file.
+    Row 1 (header): blank, then winner digits 0-9
+    Col A: loser digit (0-9)
+    Each cell: owner name
+    """
+    import csv as _csv
     grid: Dict[tuple, str] = {}
-    for winner_digit in range(10):
-        for loser_digit in range(10):
-            # Cycle through 10 fake users so each "owns" 10 squares
-            owner = fake_users[(winner_digit * 10 + loser_digit) % len(fake_users)]
-            grid[(winner_digit, loser_digit)] = owner
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = _csv.reader(f)
+        rows = list(reader)
+    for row in rows[1:]:  # skip header
+        if not row:
+            continue
+        loser_digit = int(row[0])
+        for col_idx in range(1, 11):
+            winner_digit = col_idx - 1
+            name = row[col_idx].strip() if col_idx < len(row) else ""
+            grid[(winner_digit, loser_digit)] = name
+    print(f"[INIT] Loaded squares grid from {csv_path} ({len(grid)} squares)", flush=True)
     return grid
 
-SQUARES_GRID = _build_squares_grid()
+# Loaded once at startup — just update square-assignments.csv each year, no code changes needed
+SQUARES_GRID = load_squares_grid()
 
 def lookup_square(winner_score: int, loser_score: int) -> Optional[str]:
     """Return the Discord tag for the winning square, or None."""
@@ -127,8 +135,8 @@ def should_start_polling(start_iso: str, delay_hours: float = 1.5) -> bool:
     return datetime.datetime.now(UTC) >= poll_start
 
 
-def poll_all_games() -> List[Dict]:
-    params = {"apiKey": ODDS_API_KEY, "daysFrom": 1}
+def poll_all_games(days_from: int = 1) -> List[Dict]:
+    params = {"apiKey": ODDS_API_KEY, "daysFrom": days_from}
     resp = requests.get(SCORES_ENDPOINT, params=params)
     resp.raise_for_status()
     remaining  = resp.headers.get("x-requests-remaining")
@@ -219,6 +227,48 @@ def send_discord_webhook(game: Dict):
     time.sleep(0.5)  # small buffer between sends
 
 # ---------------------------------------------------------------------------
+# Backfill: post results for already-completed games (e.g. Round of 64)
+# ---------------------------------------------------------------------------
+def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.timedelta):
+    """
+    On startup, fetch the last 3 days of scores and post any completed games
+    that have a final score. Sends one per 20 seconds. Returns updated last_send_time.
+    """
+    print(f"[BACKFILL] {now_central_str()} Fetching completed games from past 3 days...", flush=True)
+    try:
+        # daysFrom=3 pulls games up to 3 days old
+        all_scores = poll_all_games(days_from=3)
+    except Exception as e:
+        print(f"[BACKFILL] Error fetching scores: {e}", flush=True)
+        return last_send_time
+
+    completed = [g for g in all_scores if g.get("scores")]
+    print(f"[BACKFILL] Found {len(completed)} completed games to post.", flush=True)
+
+    for g in completed:
+        game = {
+            "id":         g["id"],
+            "home":       g["home_team"],
+            "away":       g["away_team"],
+            "status":     g.get("status"),
+            "scores":     g["scores"],
+            "start_time": g.get("commence_time"),
+        }
+        now_utc = datetime.datetime.now(UTC)
+        gap = (now_utc - last_send_time).total_seconds()
+        if gap < send_interval.total_seconds():
+            wait = send_interval.total_seconds() - gap
+            print(f"[BACKFILL] Waiting {wait:.1f}s before next send...", flush=True)
+            time.sleep(wait)
+
+        send_discord_webhook(game)
+        last_send_time = datetime.datetime.now(UTC)
+
+    print(f"[BACKFILL] Done posting {len(completed)} completed games.", flush=True)
+    return last_send_time
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 def main():
@@ -233,6 +283,13 @@ def main():
     except Exception as e:
         print(f"[DISCORD] Failed to send startup notification: {e}", flush=True)
 
+    # Rate-limit tracker for Discord sends (shared across backfill + live loop)
+    last_send_time = datetime.datetime.min.replace(tzinfo=UTC)
+    send_interval  = datetime.timedelta(seconds=20)
+
+    # Backfill: post all already-completed games (Round of 64, etc.)
+    last_send_time = run_backfill(last_send_time, send_interval)
+
     # Fetch today's games once
     print(f"[INIT] {now_central_str()} Loading today's games (Central)...", flush=True)
     try:
@@ -240,10 +297,6 @@ def main():
     except Exception as e:
         print(f"[INIT] Error fetching today's games: {e}", flush=True)
         games = []
-
-    # Rate-limit tracker for Discord sends
-    last_send_time = datetime.datetime.min.replace(tzinfo=UTC)
-    send_interval  = datetime.timedelta(seconds=20)
 
     while True:
         current_minute = datetime.datetime.now(UTC).minute
