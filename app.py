@@ -30,7 +30,6 @@ SCORES_ENDPOINT = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
 # ---------------------------------------------------------------------------
 # Each entry: (start_date, end_date, round_name, payout)
 TOURNAMENT_ROUNDS = [
-    (datetime.date(2026, 3, 17), datetime.date(2026, 3, 18), "First Four",   None),
     (datetime.date(2026, 3, 19), datetime.date(2026, 3, 20), "Round of 64",  60),
     (datetime.date(2026, 3, 21), datetime.date(2026, 3, 22), "Round of 32",  125),
     (datetime.date(2026, 3, 26), datetime.date(2026, 3, 27), "Sweet 16",     275),
@@ -45,6 +44,34 @@ def get_round_info(game_date: datetime.date):
         if start <= game_date <= end:
             return name, payout
     return None, None
+
+# ---------------------------------------------------------------------------
+# Tournament team filter
+# Loaded from tournament-teams.csv at startup.
+# Only games where BOTH teams are in this set will be processed.
+# ---------------------------------------------------------------------------
+def load_tournament_teams(csv_path: str = "tournament-teams.csv") -> set:
+    """Load the set of tournament team names from CSV (one per line, header 'team')."""
+    import csv as _csv
+    teams = set()
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = _csv.reader(f)
+        next(reader)  # skip header
+        for row in reader:
+            if row and row[0].strip():
+                teams.add(row[0].strip())
+    print(f"[INIT] Loaded {len(teams)} tournament teams from {csv_path}", flush=True)
+    return teams
+
+TOURNAMENT_TEAMS = load_tournament_teams()
+
+def is_tournament_game(home: str, away: str) -> bool:
+    """Return True only if both teams are in the tournament field."""
+    # Use partial matching to handle minor name variations from the Odds API
+    def team_in_field(name: str) -> bool:
+        name_lower = name.lower()
+        return any(t.lower() in name_lower or name_lower in t.lower() for t in TOURNAMENT_TEAMS)
+    return team_in_field(home) and team_in_field(away)
 
 # ---------------------------------------------------------------------------
 # Squares grid  (winner_digit, loser_digit) → owner name
@@ -114,6 +141,9 @@ def fetch_todays_games_central() -> List[Dict]:
             continue
         central_start = iso_to_utc_dt(commence).astimezone(CENTRAL)
         if central_start.date() != today_central:
+            continue
+        if not is_tournament_game(g["home_team"], g["away_team"]):
+            print(f"[FILTER] Skipping non-tournament game: {g['home_team']} vs {g['away_team']}", flush=True)
             continue
         games.append({
             "id":          g["id"],
@@ -242,8 +272,11 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
         print(f"[BACKFILL] Error fetching scores: {e}", flush=True)
         return last_send_time
 
-    completed = [g for g in all_scores if g.get("scores")]
-    print(f"[BACKFILL] Found {len(completed)} completed games to post.", flush=True)
+    completed = [
+        g for g in all_scores
+        if g.get("scores") and is_tournament_game(g["home_team"], g["away_team"])
+    ]
+    print(f"[BACKFILL] Found {len(completed)} completed tournament games to post.", flush=True)
 
     for g in completed:
         game = {
