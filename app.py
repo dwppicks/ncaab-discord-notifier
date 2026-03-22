@@ -132,6 +132,25 @@ def get_total(phone: str) -> int:
         return TOTALS.get(phone, 0)
 
 # ---------------------------------------------------------------------------
+# Completed games log — persisted to completed-games.json
+# Stores game IDs that have already been notified so backfill never
+# re-posts or re-SMSes a game, and old games aren't lost when they
+# fall outside the API's daysFrom=3 window.
+# ---------------------------------------------------------------------------
+COMPLETED_GAMES_FILE = "completed-games.json"
+
+def load_notified_ids() -> set:
+    if os.path.exists(COMPLETED_GAMES_FILE):
+        with open(COMPLETED_GAMES_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_notified_id(game_id: str, notified_ids: set):
+    notified_ids.add(game_id)
+    with open(COMPLETED_GAMES_FILE, "w") as f:
+        json.dump(list(notified_ids), f, indent=2)
+
+# ---------------------------------------------------------------------------
 # Google Sheets — phone number registry
 #
 # Expected sheet columns (from Google Form responses):
@@ -361,8 +380,8 @@ def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]
 # ---------------------------------------------------------------------------
 # Notifications (Discord + SMS)
 # ---------------------------------------------------------------------------
-def notify_game_result(game: Dict):
-    """Parse final score, post to Discord, and SMS the square winner."""
+def notify_game_result(game: Dict, notified_ids: set):
+    """Parse final score, post to Discord, SMS the square winner, and log the game ID."""
     scores     = game.get("scores", [])
     home_score = next((int(s["score"]) for s in scores if s["name"] == game["home"]), None)
     away_score = next((int(s["score"]) for s in scores if s["name"] == game["away"]), None)
@@ -418,6 +437,9 @@ def notify_game_result(game: Dict):
         else:
             print(f"[SMS] No phone registration found for square ({winner_digit},{loser_digit}) — {square_name}", flush=True)
 
+    # Persist game ID so restarts never re-notify this game
+    save_notified_id(game["id"], notified_ids)
+
 
 def _send_discord(content: str):
     if not DISCORD_WEBHOOK_URL:
@@ -440,9 +462,35 @@ def _send_discord(content: str):
     time.sleep(0.5)
 
 # ---------------------------------------------------------------------------
+# End-of-day totals summary
+# ---------------------------------------------------------------------------
+def post_daily_totals():
+    """Post cumulative tournament totals to Discord after all games complete."""
+    with REGISTRY_LOCK:
+        phone_to_name = {}
+        for reg in PHONE_REGISTRY.values():
+            for phone in reg["phones"]:
+                phone_to_name[phone] = reg["display_name"]
+
+    with TOTALS_LOCK:
+        totals_snapshot = dict(TOTALS)
+
+    if not totals_snapshot:
+        return
+
+    lines = ["📊 **Tournament Totals (running)**"]
+    ranked = sorted(totals_snapshot.items(), key=lambda x: x[1], reverse=True)
+    for phone, total in ranked:
+        name = phone_to_name.get(phone, phone)
+        lines.append(f"• {name}: **${total:,}**")
+
+    _send_discord("\n".join(lines))
+    print(f"[TOTALS] Posted end-of-day totals summary ({len(ranked)} entries).", flush=True)
+
+# ---------------------------------------------------------------------------
 # Backfill: post results for already-completed games
 # ---------------------------------------------------------------------------
-def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.timedelta) -> datetime.datetime:
+def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.timedelta, notified_ids: set) -> datetime.datetime:
     print(f"[BACKFILL] {now_central_str()} Fetching completed games from past 3 days...", flush=True)
     try:
         all_scores = poll_all_games(days_from=3)
@@ -457,8 +505,9 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
         and g.get("scores")
         and is_tournament_game(g["home_team"], g["away_team"])
         and iso_to_utc_dt(g["commence_time"]).astimezone(CENTRAL).date() >= first_round_start
+        and g["id"] not in notified_ids
     ]
-    print(f"[BACKFILL] Found {len(completed)} completed tournament games to post.", flush=True)
+    print(f"[BACKFILL] {len(completed)} unprocessed games to post (skipping already-notified).", flush=True)
 
     for g in completed:
         now_utc = datetime.datetime.now(UTC)
@@ -475,7 +524,7 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
             "status":     g.get("status"),
             "scores":     g["scores"],
             "start_time": g.get("commence_time"),
-        })
+        }, notified_ids)
         last_send_time = datetime.datetime.now(UTC)
 
     print(f"[BACKFILL] Done.", flush=True)
@@ -508,8 +557,12 @@ def main():
     last_send_time = datetime.datetime.min.replace(tzinfo=UTC)
     send_interval  = datetime.timedelta(seconds=20)
 
+    # Load already-notified game IDs (prevents duplicate posts/SMS on restart)
+    notified_ids = load_notified_ids()
+    print(f"[INIT] Loaded {len(notified_ids)} previously notified game IDs.", flush=True)
+
     # Backfill completed games (runs once at startup)
-    last_send_time = run_backfill(last_send_time, send_interval)
+    last_send_time = run_backfill(last_send_time, send_interval, notified_ids)
 
     # Outer loop: check once per day whether there are tournament games
     while True:
@@ -564,7 +617,7 @@ def main():
                             continue
 
                         print(f"[GAMES] Finished: {finished['home']} vs {finished['away']}", flush=True)
-                        notify_game_result(finished)
+                        notify_game_result(finished, notified_ids)
                         games.remove(game)
                         last_send_time = datetime.datetime.now(UTC)
                         break  # one notification per tick
@@ -573,6 +626,9 @@ def main():
 
             print(f"[HEARTBEAT] {now_central_str()} Loop complete", flush=True)
             time.sleep(60)
+
+        # Post end-of-day totals summary to Discord
+        post_daily_totals()
 
         # All games done for today — sleep until 9am Central tomorrow
         now_central  = datetime.datetime.now(CENTRAL)
