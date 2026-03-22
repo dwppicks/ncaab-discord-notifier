@@ -508,68 +508,80 @@ def main():
     last_send_time = datetime.datetime.min.replace(tzinfo=UTC)
     send_interval  = datetime.timedelta(seconds=20)
 
-    # Backfill completed games
+    # Backfill completed games (runs once at startup)
     last_send_time = run_backfill(last_send_time, send_interval)
 
-    # Load today's schedule from /events
-    print(f"[SCHEDULE] {now_central_str()} Loading today's schedule...", flush=True)
-    try:
-        games: List[Dict] = fetch_todays_schedule()
-    except Exception as e:
-        print(f"[SCHEDULE] Error fetching today's schedule: {e}", flush=True)
-        games = []
-
-    last_schedule_date = datetime.datetime.now(CENTRAL).date()
-
+    # Outer loop: check once per day whether there are tournament games
     while True:
-        # Refresh schedule if the day has rolled over
-        current_date = datetime.datetime.now(CENTRAL).date()
-        if current_date != last_schedule_date:
-            print(f"[SCHEDULE] New day detected — refreshing schedule.", flush=True)
-            try:
-                games = fetch_todays_schedule()
-            except Exception as e:
-                print(f"[SCHEDULE] Error refreshing schedule: {e}", flush=True)
-            last_schedule_date = current_date
+        print(f"[SCHEDULE] {now_central_str()} Checking today's schedule...", flush=True)
+        try:
+            games: List[Dict] = fetch_todays_schedule()
+        except Exception as e:
+            print(f"[SCHEDULE] Error fetching schedule: {e} — retrying in 1 hour.", flush=True)
+            time.sleep(3600)
+            continue
 
-        current_minute = datetime.datetime.now(UTC).minute
-        if current_minute % 2 == 0 and games:
-            print("=== Polling loop tick ===", flush=True)
-            print(f"[GAMES] {len(games)} games remaining", flush=True)
+        if not games:
+            # Sleep until 9am Central tomorrow
+            now_central  = datetime.datetime.now(CENTRAL)
+            tomorrow_9am = (now_central + datetime.timedelta(days=1)).replace(
+                hour=9, minute=0, second=0, microsecond=0
+            )
+            sleep_secs = (tomorrow_9am - now_central).total_seconds()
+            print(f"[SCHEDULE] No tournament games today — sleeping until {tomorrow_9am.strftime('%Y-%m-%d 9:00 AM %Z')} ({sleep_secs/3600:.1f}h).", flush=True)
+            time.sleep(sleep_secs)
+            continue
 
-            try:
-                all_scores = poll_all_games(days_from=2)
-            except Exception as e:
-                print(f"[ODDS] Error: {e}", flush=True)
-                time.sleep(60)
-                continue
+        # Inner loop: poll until all today's games are completed
+        print(f"[SCHEDULE] {len(games)} game(s) today — entering polling loop.", flush=True)
+        while games:
+            current_minute = datetime.datetime.now(UTC).minute
+            if current_minute % 2 == 0:
+                print("=== Polling loop tick ===", flush=True)
+                print(f"[GAMES] {len(games)} games remaining", flush=True)
 
-            for game in list(games):  # copy so removal mid-loop is safe
-                if should_start_polling(game["start_time"], delay_hours=1.833):
-                    if not game["poll_active"]:
-                        print(f"[GAMES] Activating polling for {game['home']} vs {game['away']}", flush=True)
-                        game["poll_active"] = True
-                else:
-                    print(f"[GAMES] Not yet time to poll {game['home']} vs {game['away']}", flush=True)
+                try:
+                    all_scores = poll_all_games(days_from=2)
+                except Exception as e:
+                    print(f"[ODDS] Error: {e}", flush=True)
+                    time.sleep(60)
                     continue
 
-                finished = find_finished_for_game(game, all_scores)
-                if finished:
-                    now_utc = datetime.datetime.now(UTC)
-                    if now_utc - last_send_time < send_interval:
-                        print("[NOTIFY] Skipping this tick — respecting 20s interval", flush=True)
+                for game in list(games):  # copy so removal mid-loop is safe
+                    if should_start_polling(game["start_time"], delay_hours=1.833):
+                        if not game["poll_active"]:
+                            print(f"[GAMES] Activating polling for {game['home']} vs {game['away']}", flush=True)
+                            game["poll_active"] = True
+                    else:
+                        print(f"[GAMES] Not yet time to poll {game['home']} vs {game['away']}", flush=True)
                         continue
 
-                    print(f"[GAMES] Finished: {finished['home']} vs {finished['away']}", flush=True)
-                    notify_game_result(finished)
-                    games.remove(game)
-                    last_send_time = datetime.datetime.now(UTC)
-                    break  # one notification per tick
-                else:
-                    print(f"[DEBUG] {game['home']} vs {game['away']} no scores yet", flush=True)
+                    finished = find_finished_for_game(game, all_scores)
+                    if finished:
+                        now_utc = datetime.datetime.now(UTC)
+                        if now_utc - last_send_time < send_interval:
+                            print("[NOTIFY] Skipping this tick — respecting 20s interval", flush=True)
+                            continue
 
-        print(f"[HEARTBEAT] {now_central_str()} Loop complete", flush=True)
-        time.sleep(60)
+                        print(f"[GAMES] Finished: {finished['home']} vs {finished['away']}", flush=True)
+                        notify_game_result(finished)
+                        games.remove(game)
+                        last_send_time = datetime.datetime.now(UTC)
+                        break  # one notification per tick
+                    else:
+                        print(f"[DEBUG] {game['home']} vs {game['away']} no scores yet", flush=True)
+
+            print(f"[HEARTBEAT] {now_central_str()} Loop complete", flush=True)
+            time.sleep(60)
+
+        # All games done for today — sleep until 9am Central tomorrow
+        now_central  = datetime.datetime.now(CENTRAL)
+        tomorrow_9am = (now_central + datetime.timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+        sleep_secs = (tomorrow_9am - now_central).total_seconds()
+        print(f"[SCHEDULE] All games complete for today — sleeping until {tomorrow_9am.strftime('%Y-%m-%d 9:00 AM %Z')} ({sleep_secs/3600:.1f}h).", flush=True)
+        time.sleep(sleep_secs)
 
 
 if __name__ == "__main__":
