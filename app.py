@@ -343,16 +343,18 @@ def find_finished_for_game(game: Dict, all_scores: List[Dict]) -> Optional[Dict]
     for g in all_scores:
         if g.get("id") != game["id"]:
             continue
-        scores = g.get("scores")
-        if scores:
+        # Must have completed=True AND a scores array — avoids triggering on live games
+        if g.get("completed") is True and g.get("scores"):
             return {
                 "id":         g["id"],
                 "home":       g["home_team"],
                 "away":       g["away_team"],
-                "status":     g.get("status"),
-                "scores":     scores,
+                "completed":  True,
+                "scores":     g["scores"],
                 "start_time": g.get("commence_time"),
             }
+        elif g.get("scores") and not g.get("completed"):
+            print(f"[DEBUG] {g['home_team']} vs {g['away_team']} has scores but completed=False — still in progress, skipping.", flush=True)
     return None
 
 # ---------------------------------------------------------------------------
@@ -450,7 +452,8 @@ def run_backfill(last_send_time: datetime.datetime, send_interval: datetime.time
     first_round_start = datetime.date(2026, 3, 19)
     completed = [
         g for g in all_scores
-        if g.get("scores")
+        if g.get("completed") is True
+        and g.get("scores")
         and is_tournament_game(g["home_team"], g["away_team"])
         and iso_to_utc_dt(g["commence_time"]).astimezone(CENTRAL).date() >= first_round_start
     ]
