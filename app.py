@@ -29,8 +29,9 @@ GOOGLE_CREDS_JSON   = os.getenv("GOOGLE_CREDS_JSON")    # Service account JSON a
 # ---------------------------------------------------------------------------
 # Odds API config
 # ---------------------------------------------------------------------------
-SPORT_KEY       = "basketball_ncaab"
-SCORES_ENDPOINT = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
+SPORT_KEY        = "basketball_ncaab"
+SCORES_ENDPOINT  = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores"
+EVENTS_ENDPOINT  = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/events"
 
 # ---------------------------------------------------------------------------
 # Tournament round definitions (Central dates → payout)
@@ -293,9 +294,10 @@ def now_central_str() -> str:
 # ---------------------------------------------------------------------------
 # Odds API helpers
 # ---------------------------------------------------------------------------
-def fetch_todays_games_central() -> List[Dict]:
-    params = {"apiKey": ODDS_API_KEY, "daysFrom": 1}
-    resp   = requests.get(SCORES_ENDPOINT, params=params)
+def fetch_todays_schedule() -> List[Dict]:
+    """Fetch today's tournament games from the /events endpoint (upcoming only, no score data)."""
+    params = {"apiKey": ODDS_API_KEY}
+    resp   = requests.get(EVENTS_ENDPOINT, params=params)
     resp.raise_for_status()
     data   = resp.json()
 
@@ -310,7 +312,7 @@ def fetch_todays_games_central() -> List[Dict]:
         if central_start.date() != today_central:
             continue
         if not is_tournament_game(g["home_team"], g["away_team"]):
-            print(f"[FILTER] Skipping non-tournament game: {g['home_team']} vs {g['away_team']}", flush=True)
+            print(f"[FILTER] Skipping non-tournament event: {g['home_team']} vs {g['away_team']}", flush=True)
             continue
         games.append({
             "id":          g["id"],
@@ -318,12 +320,11 @@ def fetch_todays_games_central() -> List[Dict]:
             "away":        g["away_team"],
             "start_time":  commence,
             "poll_active": False,
-            "notified":    False,
         })
 
-    print(f"[INIT] {now_central_str()} Fetched {len(games)} tournament games for today.", flush=True)
+    print(f"[SCHEDULE] {now_central_str()} Loaded {len(games)} tournament games for today.", flush=True)
     for game in games:
-        print(f"[INIT]   {game['home']} vs {game['away']} at {format_game_time_central(game['start_time'])}", flush=True)
+        print(f"[SCHEDULE]   {game['home']} vs {game['away']} at {format_game_time_central(game['start_time'])}", flush=True)
     return games
 
 def should_start_polling(start_iso: str, delay_hours: float = 1.5) -> bool:
@@ -510,30 +511,41 @@ def main():
     # Backfill completed games
     last_send_time = run_backfill(last_send_time, send_interval)
 
-    # Load today's games
-    print(f"[INIT] {now_central_str()} Loading today's games...", flush=True)
+    # Load today's schedule from /events
+    print(f"[SCHEDULE] {now_central_str()} Loading today's schedule...", flush=True)
     try:
-        games: List[Dict] = fetch_todays_games_central()
+        games: List[Dict] = fetch_todays_schedule()
     except Exception as e:
-        print(f"[INIT] Error fetching today's games: {e}", flush=True)
+        print(f"[SCHEDULE] Error fetching today's schedule: {e}", flush=True)
         games = []
 
+    last_schedule_date = datetime.datetime.now(CENTRAL).date()
+
     while True:
+        # Refresh schedule if the day has rolled over
+        current_date = datetime.datetime.now(CENTRAL).date()
+        if current_date != last_schedule_date:
+            print(f"[SCHEDULE] New day detected — refreshing schedule.", flush=True)
+            try:
+                games = fetch_todays_schedule()
+            except Exception as e:
+                print(f"[SCHEDULE] Error refreshing schedule: {e}", flush=True)
+            last_schedule_date = current_date
+
         current_minute = datetime.datetime.now(UTC).minute
         if current_minute % 2 == 0 and games:
             print("=== Polling loop tick ===", flush=True)
-            active_games = [g for g in games if not g["notified"]]
-            print(f"[GAMES] {len(active_games)} games not yet notified", flush=True)
+            print(f"[GAMES] {len(games)} games remaining", flush=True)
 
             try:
-                all_scores = poll_all_games()
+                all_scores = poll_all_games(days_from=2)
             except Exception as e:
                 print(f"[ODDS] Error: {e}", flush=True)
                 time.sleep(60)
                 continue
 
-            for game in active_games:
-                if should_start_polling(game["start_time"]):
+            for game in list(games):  # copy so removal mid-loop is safe
+                if should_start_polling(game["start_time"], delay_hours=1.833):
                     if not game["poll_active"]:
                         print(f"[GAMES] Activating polling for {game['home']} vs {game['away']}", flush=True)
                         game["poll_active"] = True
@@ -550,8 +562,8 @@ def main():
 
                     print(f"[GAMES] Finished: {finished['home']} vs {finished['away']}", flush=True)
                     notify_game_result(finished)
-                    game["notified"] = True
-                    last_send_time   = datetime.datetime.now(UTC)
+                    games.remove(game)
+                    last_send_time = datetime.datetime.now(UTC)
                     break  # one notification per tick
                 else:
                     print(f"[DEBUG] {game['home']} vs {game['away']} no scores yet", flush=True)
